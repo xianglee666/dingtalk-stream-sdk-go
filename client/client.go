@@ -141,33 +141,42 @@ func (cli *StreamClient) processLoop() {
 		return
 	}
 
+	// Use context instead of closeChan to avoid send-on-closed-channel panic when
+	// read/ping goroutines outlive processLoop exit (issues #27, #28, #32).
+	loopCtx, cancelLoop := context.WithCancel(context.Background())
 	readChan := make(chan []byte)
 	pongChan := make(chan struct{})
-	closeChan := make(chan struct{})
-	defer func() { close(closeChan) }()
-	defer func() { close(pongChan) }()
-	defer func() { close(readChan) }()
+	defer func() {
+		cancelLoop()
+	}()
 
 	cli.conn.SetPongHandler(func(appData string) error {
-		pongChan <- struct{}{}
+		select {
+		case pongChan <- struct{}{}:
+		case <-loopCtx.Done():
+		}
 		return nil
 	})
-	//开始启动协程读数据
+
 	go func() {
+		defer close(readChan)
 		for {
 			messageType, message, err := cli.conn.ReadMessage()
 			if err != nil {
 				logger.GetLogger().Errorf("connection process read message error: messageType=[%d] message=[%s] error=[%s]", messageType, string(message), err)
-				closeChan <- struct{}{}
+				cancelLoop()
 				return
 			}
 			if messageType == websocket.TextMessage {
-				readChan <- message
+				select {
+				case readChan <- message:
+				case <-loopCtx.Done():
+					return
+				}
 			}
 		}
 	}()
 
-	//循环处理事件
 	for {
 		timer := time.NewTimer(cli.keepAliveIdle)
 		select {
@@ -191,11 +200,14 @@ func (cli *StreamClient) processLoop() {
 					return
 				case <-time.After(5 * time.Second):
 					logger.GetLogger().Errorf("ping time out, connection is closing")
-					closeChan <- struct{}{}
+					cancelLoop()
+					return
+				case <-loopCtx.Done():
 					return
 				}
 			}()
-		case <-closeChan:
+		case <-loopCtx.Done():
+			timer.Stop()
 			return
 		}
 	}
